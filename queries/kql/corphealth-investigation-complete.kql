@@ -1,1 +1,1447 @@
+// ========================================
+// CorpHealth Operations Activity Review
+// Complete Investigation Query Library with Narrative
+// ========================================
+// Device: CH-OPS-WKS02
+// Investigation Period: November 23 - November 30, 2025
+// Case Classification: Operations Activity Review → Confirmed Intrusion
+// Lead Analyst: Jarvis
+// Platform: Microsoft Defender for Endpoint / Azure Sentinel
+// ========================================
 
+// ===========================================
+// INVESTIGATION CONTEXT
+// ===========================================
+// Your organization recently deployed CorpHealth, a lightweight system monitoring
+// and maintenance framework using scheduled tasks, background services, and 
+// diagnostic scripts across operational workstations.
+//
+// A dedicated operational account (ops.maintenance) was provisioned with local
+// administrator privileges to:
+// - Register scheduled maintenance tasks
+// - Install/remove system services
+// - Write diagnostic data to protected locations
+// - Perform automated cleanup and telemetry
+//
+// This account was designed for automation only - NOT interactive sign-ins.
+//
+// In mid-November, routine monitoring surfaced unusual activity on a workstation
+// in the operations environment. Activity appeared consistent with maintenance
+// at first glance, but closer review revealed:
+// - Activity outside normal maintenance windows
+// - Script execution patterns deviating from baselines
+// - Manual process launches instead of automation
+// - Behaviors resembling credential compromise
+//
+// You are the lead analyst reviewing historical telemetry to determine:
+// - What system was affected
+// - When suspicious activity occurred
+// - How the activity progressed
+// - Whether this was authorized automation or account misuse
+// ===========================================
+
+// ===========================================
+// FLAG 0: ESTABLISH INVESTIGATION SCOPE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Overnight, the monitoring queue tagged a single workstation with a cluster 
+// of correlated events. The alerts were low-severity and categorized under 
+// "Operational Maintenance Activity (Unclassified)". However, timestamps 
+// looked unusual - the sequence occurred during an off-hours window in 
+// mid-November when NO maintenance jobs were scheduled.
+//
+// YOUR TASK:
+// Confirm which workstation generated the unusual telemetry and establish
+// the timeframe you'll be working within for the rest of the investigation.
+//
+// ANALYST THINKING:
+// Need to find a workstation showing:
+// - Small cluster of events during unusual maintenance window
+// - Activity between Mid-November to Early December
+// - Multiple event types (Process, Network, File, Script operations)
+// - CorpHealth naming convention (hint: ch-xxx-xxxNN)
+// ===========================================
+
+DeviceEvents
+| where TimeGenerated between (datetime(2025-11-10) .. datetime(2025-12-05))
+| where hourofday(TimeGenerated) between (18 .. 23) or hourofday(TimeGenerated) between (0 .. 6) // Off-hours
+| where DeviceName startswith "ch-" // CorpHealth naming convention
+| summarize 
+    EventCount = count(),
+    EventTypes = make_set(ActionType),
+    FirstEvent = min(TimeGenerated),
+    LastEvent = max(TimeGenerated),
+    UniqueProcesses = dcount(InitiatingProcessFileName)
+    by DeviceName
+| where EventCount > 10 // Clustered activity
+| order by EventCount desc
+
+// FINDING: ch-ops-wks02
+// SIGNIFICANCE: Single endpoint with concentrated off-hours activity
+// NEXT STEP: Investigate what scripts are running on this specific workstation
+
+// ===========================================
+// FLAG 1: IDENTIFY UNIQUE MAINTENANCE FILE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've confirmed that CH-OPS-WKS02 is the workstation of interest and 
+// narrowed your timeframe to the mid-November maintenance window.
+//
+// Before digging into outbound activity, you decide to sanity-check what's
+// actually running on this box during "routine" operations.
+//
+// CorpHealth uses a mix of scheduled scripts and diagnostic utilities across
+// multiple endpoints. Most are standard and repeated across many machines.
+// But one script on CH-OPS-WKS02 appears UNIQUE to this host, tied to 
+// recent maintenance work.
+//
+// YOUR TASK:
+// Identify which "maintenance" file stands out here before treating any
+// behavior as normal.
+//
+// ANALYST THINKING:
+// Need to compare filenames across devices and find a script that ONLY 
+// shows up on CH-OPS-WKS02. Focus on script-like files (.ps1) in 
+// maintenance locations.
+// ===========================================
+
+DeviceFileEvents
+| where TimeGenerated between (datetime(2025-11-10) .. datetime(2025-12-05))
+| where FileName endswith ".ps1" // PowerShell scripts
+| where FolderPath has_any ("ProgramData", "Windows", "Temp", "AppData") // Maintenance locations
+| summarize 
+    DeviceCount = dcount(DeviceName),
+    Devices = make_set(DeviceName)
+    by FileName
+| where DeviceCount == 1 // Unique to one device
+| where Devices has "ch-ops-wks02"
+| project FileName, DeviceCount, Devices
+
+// FINDING: MaintenanceRunner_Distributed.ps1
+// SIGNIFICANCE: Script exists ONLY on compromised workstation - not standard deployment
+// RED FLAG: Why does this device have a unique maintenance script?
+// NEXT STEP: Examine what this script actually does when executed
+
+// ===========================================
+// FLAG 2: OUTBOUND BEACON INDICATOR
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After identifying the unique maintenance script, you now pivot to determine
+// what this script actually DID when executed.
+//
+// CorpHealth agents often phone home to internal listeners or update servers,
+// but the behavior from CH-OPS-WKS02 feels different.
+//
+// YOUR TASK:
+// Determine when the maintenance script FIRST initiated outbound communication.
+//
+// ANALYST THINKING:
+// Use DeviceNetworkEvents to filter for network activity generated by the
+// suspicious script. The script's command line should appear inside
+// InitiatingProcessCommandLine. Need the exact timestamp of first beacon.
+// ===========================================
+
+DeviceNetworkEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessCommandLine contains "MaintenanceRunner_Distributed.ps1"
+| project TimeGenerated, RemoteIP, RemotePort, ActionType, InitiatingProcessCommandLine
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: 2025-11-23T03:46:08.400686Z
+// SIGNIFICANCE: First outbound network activity from the suspicious script
+// TIMELINE ANCHOR: This is our earliest confirmed malicious activity timestamp
+// NEXT STEP: Identify WHERE the script was trying to beacon to
+
+// ===========================================
+// FLAG 3: IDENTIFY THE BEACON DESTINATION
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've confirmed the suspicious PowerShell activity on CH-OPS-WKS02, and
+// the process responsible appears to be tied to a maintenance-related script.
+//
+// Now leadership wants to know something more urgent:
+// WHERE was the workstation trying to beacon to?
+//
+// Even if the connection failed, the attempt itself can reveal intent:
+// - Exfiltration staging
+// - Command-and-control signaling
+// - Internal lateral movement
+//
+// YOUR TASK:
+// Extract the actual network destination the host attempted to reach.
+// This beacon traffic is your first concrete IOC leading off-host.
+//
+// ANALYST THINKING:
+// Filter DeviceNetworkEvents on CH-OPS-WKS02, look for events where
+// InitiatingProcessCommandLine contains the maintenance script.
+// Need: IP:Port format
+// ===========================================
+
+DeviceNetworkEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessCommandLine contains "MaintenanceRunner_Distributed.ps1"
+| summarize 
+    FirstAttempt = min(TimeGenerated),
+    AttemptCount = count()
+    by RemoteIP, RemotePort
+| extend Destination = strcat(RemoteIP, ":", RemotePort)
+| order by FirstAttempt asc
+| project Destination, FirstAttempt, AttemptCount
+
+// FINDING: 127.0.0.1:8080
+// SIGNIFICANCE: Localhost beaconing - possible local proxy or tunneling setup
+// CRITICAL: This suggests attacker established local C2 infrastructure
+// NEXT STEP: Confirm when the beacon connection actually succeeded
+
+// ===========================================
+// FLAG 4: CONFIRM THE SUCCESSFUL BEACON TIMESTAMP
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Your investigation now has a clearer shape:
+// - The host ran a suspicious maintenance script
+// - That script attempted to beacon out
+// - You've identified the destination IP and port
+//
+// But now you need to know something more specific and operationally important:
+// When did the beacon FINALLY SUCCEED?
+//
+// Even if some earlier attempts failed, a successful outbound connection
+// indicates the earliest point the actor could have received instructions
+// or data back from the host.
+//
+// This timestamp often becomes the pivot point for reconstructing the
+// attack timeline.
+//
+// YOUR TASK:
+// Isolate the latest (max) ConnectionSuccess event originating from the
+// maintenance script, including the remote IP and port.
+//
+// ANALYST THINKING:
+// Filter for ActionType == "ConnectionSuccess"
+// Match same RemoteIP and RemotePort from previous flag
+// Sort by timestamp descending and take the newest entry
+// ===========================================
+
+DeviceNetworkEvents
+| where DeviceName == "ch-ops-wks02"
+| where ActionType == "ConnectionSuccess"
+| where InitiatingProcessCommandLine contains "MaintenanceRunner_Distributed.ps1"
+| where RemoteIP == "127.0.0.1" and RemotePort == 8080
+| summarize LatestSuccess = max(TimeGenerated)
+| project LatestSuccess
+
+// FINDING: 2025-11-30T01:03:17.6985973Z
+// SIGNIFICANCE: Definitive "handshake moment" - attacker could begin issuing commands
+// TIMELINE: 7 days after initial beacon attempt - persistent reconnection attempts
+// CONCERN: Shortly after this, unusual filesystem activity begins
+// NEXT STEP: Investigate staging directories and file artifacts
+
+// ===========================================
+// FLAG 5: UNEXPECTED STAGING ACTIVITY DETECTED
+// ===========================================
+// INVESTIGATION CONTEXT:
+// With the timestamp confirmed, the picture sharpens. You now know exactly
+// when the maintenance script successfully reached out to the external IP.
+//
+// But something isn't sitting right.
+//
+// Shortly after the successful outbound connection, the workstation's event
+// telemetry begins to show unusual activity in directories that normally
+// stay quiet. These aren't typical heartbeat logs or scheduled maintenance
+// outputs you expect from CH-OPS-WKS02.
+//
+// Instead, you see artifacts appearing in diagnostic locations, temporary
+// export folders, and operational paths - almost as if the attacker is
+// preparing the environment for later stages.
+//
+// Before attackers exfiltrate or execute heavier actions, they almost always
+// prepare a workspace - a location on disk to store intermediate files, drop
+// transient payloads, or build export bundles.
+//
+// YOUR TASK:
+// Determine exactly what artifacts the attacker staged. This will help you
+// understand what they intended to take - or alter.
+//
+// ANALYST THINKING:
+// Look for created files under "CorpHealth" operational folders, especially
+// Diagnostics directories. Attackers commonly use legitimate paths for staging.
+// ===========================================
+
+DeviceFileEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated >= datetime(2025-11-23T03:46:08Z) // After beacon
+| where ActionType == "FileCreated"
+| where FolderPath has "CorpHealth" and FolderPath has "Diagnostics"
+| where FileName endswith ".csv"
+| order by TimeGenerated asc
+| project TimeGenerated, FolderPath, FileName, SHA256
+| take 1
+
+// FINDING: C:\ProgramData\Microsoft\Diagnostics\CorpHealth\inventory_6ECFD4DF.csv
+// SIGNIFICANCE: Attacker staging data in legitimate diagnostic directory
+// HIDING IN PLAIN SIGHT: Using official CorpHealth paths to avoid detection
+// FILE TYPE: CSV suggests data collection/enumeration
+// NEXT STEP: Verify file integrity with cryptographic hash
+
+// ===========================================
+// FLAG 6: CONFIRM THE STAGED FILE'S INTEGRITY
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Now that you've identified the attacker's staging location, you've recovered
+// the suspicious file placed in the system's diagnostic directory.
+//
+// But finding the file is just the beginning.
+//
+// Analysts rarely trust a recovered artifact at face value - especially one
+// dropped during a suspected intrusion.
+//
+// In real incident response:
+// - Hashes help confirm whether files match known malware
+// - They allow comparison against threat intelligence feeds
+// - They ensure chain-of-custody integrity during analysis
+//
+// YOUR TASK:
+// Extract the SHA-256 hash of the staged file you identified in the previous flag.
+//
+// ANALYST THINKING:
+// Use DeviceFileEvents to retrieve hash metadata for the file.
+// This becomes a permanent IOC for threat intelligence sharing.
+// ===========================================
+
+DeviceFileEvents
+| where DeviceName == "ch-ops-wks02"
+| where FolderPath == @"C:\ProgramData\Microsoft\Diagnostics\CorpHealth"
+| where FileName == "inventory_6ECFD4DF.csv"
+| where ActionType == "FileCreated"
+| project TimeGenerated, FileName, SHA256, FileSize
+
+// FINDING: 7f6393568e414fc564dad6f49a06a161618b50873404503f82c4447d239f12d8
+// SIGNIFICANCE: Cryptographic fingerprint established for IOC tracking
+// IOC STATUS: Can be compared against threat intel feeds and shared with SOC
+// NEXT STEP: Search for duplicate or related staging artifacts
+
+// ===========================================
+// FLAG 7: IDENTIFY THE DUPLICATE STAGED ARTIFACT
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've confirmed the SHA-256 hash of the attacker's primary staging file.
+// Good. But something feels off.
+//
+// Threat actors often stage redundant or decoy files for several reasons:
+// - To confuse responders
+// - To test which folders are monitored
+// - To discard intermediary versions
+// - To probe what security tools detect or ignore
+// - To preserve backups of their in-progress work
+//
+// When you zoom out and look across all file events on CH-OPS-WKS02,
+// you notice patterns in the filenames, sizes, and write times.
+//
+// One particular detail stands out: It looks like another file exists that is:
+// - Very similar in name
+// - Roughly the same size
+// - Written around the same timeframe
+// - BUT has a DIFFERENT SHA-256 hash
+// - AND is located in a DIFFERENT directory
+//
+// This is almost certainly an attacker "working copy" or alternate staging location.
+//
+// YOUR TASK:
+// Find the second file. Provide the complete absolute path.
+//
+// ANALYST THINKING:
+// Search for other files containing "inventory" created around same timeframe.
+// Different hash = different content = iterative data processing
+// ===========================================
+
+DeviceFileEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated >= datetime(2025-11-23T03:46:08Z)
+| where FileName contains "inventory"
+| where FileName endswith ".csv"
+| where SHA256 != "7f6393568e414fc564dad6f49a06a161618b50873404503f82c4447d239f12d8"
+| project TimeGenerated, FolderPath, FileName, SHA256
+| order by TimeGenerated asc
+
+// FINDING: C:\Users\ops.maintenance\AppData\Local\Temp\CorpHealth\inventory_tmp_6ECFD4DF.csv
+// SIGNIFICANCE: Attacker created WORKING COPY in user's temp directory
+// PATTERN: Different hash suggests data transformation/filtering before exfiltration
+// IMPLICATION: Attacker preparing curated datasets, not raw dumps
+// NEXT STEP: Investigate credential access attempts
+
+// ===========================================
+// FLAG 8: SUSPICIOUS REGISTRY ACTIVITY
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've uncovered something important. Not only did the attacker stage a
+// primary diagnostic export in the CorpHealth directory, but you also
+// discovered a second, nearly identical file hidden deeper in the user's
+// Temp directory.
+//
+// That's not accidental.
+//
+// This pattern usually suggests intermediate processing, where the attacker
+// may have been transforming or filtering data before exfiltration.
+//
+// But there's an even more concerning implication:
+// If the attacker is staging diagnostic exports and building curated datasets
+// in hidden working directories, it raises the question:
+//
+// What credentials might they have accessed to support the rest of the attack chain?
+//
+// As you continue reviewing the timeline, a new cluster of events appears -
+// this time involving the creation of a suspicious registry key under HKLM.
+// The events don't look like standard system operations or anything produced
+// by authorized CorpHealth maintenance scripts.
+//
+// Instead, they strongly resemble credential harvesting or token inspection attempts.
+//
+// YOUR TASK:
+// Identify which exact registry key was created or touched during credential
+// harvesting simulation activity.
+//
+// ANALYST THINKING:
+// Look for registry events shortly before/after staging files were created.
+// Filter RegistryKeyCreated or RegistryValueSet actions.
+// Focus on keys that shouldn't exist on normal workstations.
+// ===========================================
+
+DeviceRegistryEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated between (datetime(2025-11-23T03:45:00Z) .. datetime(2025-11-23T04:00:00Z))
+| where ActionType in ("RegistryKeyCreated", "RegistryValueSet")
+| where RegistryKey contains "CorpHealth"
+| where RegistryKey startswith "HKEY_LOCAL_MACHINE"
+| project TimeGenerated, ActionType, RegistryKey, RegistryValueName, RegistryValueData
+| order by TimeGenerated asc
+
+// FINDING: HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\EventLog\Application\CorpHealthAgent
+// SIGNIFICANCE: Attacker creating fake event log source for CorpHealthAgent
+// TECHNIQUE: Attempting to blend malicious activity into legitimate logs
+// IMPLICATION: Preparation for credential harvesting or log manipulation
+// NEXT STEP: Search for scheduled task persistence mechanisms
+
+// ===========================================
+// FLAG 9: SCHEDULED TASK PERSISTENCE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You continue examining the activity coming from CH-OPS-WKS02.
+//
+// Moments after the credential-related registry anomaly, you notice
+// additional persistence patterns.
+//
+// Even though some attempts may have failed due to permission issues,
+// at least one scheduled task was successfully created earlier in the
+// investigation window.
+//
+// This task is NOT part of CorpHealth's standard approved tasks and
+// represents an unauthorized persistence mechanism.
+//
+// YOUR TASK:
+// Identify which Scheduled Task the attacker first created.
+//
+// ANALYST THINKING:
+// Search DeviceRegistryEvents for:
+// - ActionType == "RegistryKeyCreated" or "RegistryValueSet"
+// - Path contains: Schedule\TaskCache\Tree\
+// - Focus on tasks with "CorpHealth" in name (masquerading as legitimate)
+// ===========================================
+
+DeviceRegistryEvents
+| where DeviceName == "ch-ops-wks02"
+| where ActionType in ("RegistryKeyCreated", "RegistryValueSet")
+| where RegistryKey contains @"Schedule\TaskCache\Tree"
+| where RegistryKey contains "CorpHealth"
+| project TimeGenerated, ActionType, RegistryKey
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\CorpHealth_A65E64
+// SIGNIFICANCE: Unauthorized scheduled task masquerading as legitimate CorpHealth maintenance
+// PERSISTENCE: Task will survive reboots and execute attacker payload automatically
+// NAMING PATTERN: Random hex suffix (A65E64) suggests automated generation
+// NEXT STEP: Identify Run key persistence attempts
+
+// ===========================================
+// FLAG 10: REGISTRY-BASED PERSISTENCE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// As your investigation advances, you pivot toward examining whether the
+// attacker attempted any form of autostart persistence.
+//
+// Your earlier findings suggested the script may have tampered with startup
+// mechanisms - but now you have confirmation.
+//
+// You observe:
+// - A new Run key value created
+// - A value written pointing to execution of a PowerShell script
+// - And the value DELETED shortly after
+//
+// This pattern is intentional - it resembles EPHEMERAL PERSISTENCE, meant to
+// survive a single reboot or login, trigger once, and then erase its tracks.
+//
+// YOUR TASK:
+// Identify which value name was added to the Run key.
+//
+// ANALYST THINKING:
+// Filter DeviceRegistryEvents for:
+// - RegistryKeyCreated, RegistryValueSet, RegistryValueDeleted
+// - Path contains: CurrentVersion\Run
+// - Look for rapid create→delete pattern
+// ===========================================
+
+DeviceRegistryEvents
+| where DeviceName == "ch-ops-wks02"
+| where RegistryKey contains @"CurrentVersion\Run"
+| where ActionType in ("RegistryValueSet", "RegistryValueDeleted")
+| where RegistryValueName contains "Maintenance"
+| project TimeGenerated, ActionType, RegistryKey, RegistryValueName, RegistryValueData
+| order by TimeGenerated asc
+
+// FINDING: MaintenanceRunner
+// SIGNIFICANCE: Short-lived Run key persistence - added and quickly removed
+// PATTERN: Flip-flop behavior suggests attacker TESTING what sticks
+// STEALTH: Quick deletion avoids long-term detection
+// NEXT STEP: Identify privilege escalation attempts
+
+// ===========================================
+// FLAG 11: PRIVILEGE ESCALATION EVENT TIMESTAMP
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You document the short-lived Run-key persistence, noting how quickly it
+// was added and removed. Normally, this kind of flip-flop suggests
+// experimentation - an attacker testing what sticks, rather than deploying
+// a long-term mechanism.
+//
+// Before you can pivot to your next hypothesis, another artifact catches
+// your eye: a suspicious Application event generated by powershell.exe,
+// referencing a ConfigAdjust attempt.
+//
+// This isn't normal operator behavior. Privilege adjustments are commonly
+// probed by attackers who want higher-level access before continuing their
+// intrusion.
+//
+// YOUR TASK:
+// Locate the exact Timestamp (UTC) of the FIRST ConfigAdjust privilege-
+// escalation event.
+//
+// ANALYST THINKING:
+// This comes from the Application log - not process creation, registry,
+// or network events. Look for event payload in AdditionalFields describing
+// configuration adjustment.
+// ===========================================
+
+DeviceEvents
+| where DeviceName == "ch-ops-wks02"
+| where ActionType == "ApplicationLogEvent"
+| where AdditionalFields contains "ConfigAdjust"
+| project TimeGenerated, ActionType, AdditionalFields
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: 2025-11-23T03:47:21.8529749Z
+// SIGNIFICANCE: Privilege escalation attempt detected
+// TIMELINE: ~1 minute after initial beacon (rapid progression)
+// TECHNIQUE: ConfigAdjust simulation suggests testing privilege boundaries
+// NEXT STEP: Investigate attempts to weaken host defenses
+
+// ===========================================
+// FLAG 12: IDENTIFY THE AV EXCLUSION ATTEMPT
+// ===========================================
+// INVESTIGATION CONTEXT:
+// With persistence mechanisms identified and the timeline growing clearer,
+// you shift your attention toward another common phase in intrusions:
+// weakening host defenses.
+//
+// Attackers often attempt to disable or bypass security controls immediately
+// before staging files or running higher-risk payloads.
+//
+// As the hunt progresses, you uncover telemetry suggesting a modification
+// attempt targeting endpoint protection settings.
+//
+// While the change did NOT SUCCEED - likely blocked by permissions - the
+// intent is unmistakable.
+//
+// YOUR TASK:
+// Identify exactly what folder path the adversary tried to exclude from
+// antivirus scanning.
+//
+// ANALYST THINKING:
+// Look for ExclusionPath in AdditionalFields or registry events related
+// to Windows Defender exclusions. Even failed attempts show intent.
+// ===========================================
+
+DeviceEvents
+| where DeviceName == "ch-ops-wks02"
+| where ActionType contains "AntivirusDetection" or AdditionalFields contains "ExclusionPath"
+| extend ExclusionPath = tostring(parse_json(AdditionalFields).ExclusionPath)
+| where isnotempty(ExclusionPath)
+| project TimeGenerated, ExclusionPath, AdditionalFields
+| order by TimeGenerated asc
+
+// Alternative if above doesn't work:
+DeviceRegistryEvents
+| where DeviceName == "ch-ops-wks02"
+| where RegistryKey contains "Windows Defender" and RegistryKey contains "Exclusions"
+| where RegistryValueData contains "staging"
+| project TimeGenerated, RegistryKey, RegistryValueName, RegistryValueData
+
+// FINDING: C:\ProgramData\Corp\Ops\staging
+// SIGNIFICANCE: Attacker attempted to exclude staging directory from AV scanning
+// FAILED: Permission denied, but intent is clear
+// IMPLICATION: Attacker knew they would be staging malicious files here
+// NEXT STEP: Investigate encoded PowerShell execution
+
+// ===========================================
+// FLAG 13: POWERSHELL ENCODED COMMAND EXECUTION
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You continue unraveling the attacker's chain of activity. After staging
+// data, many threat actors pivot into script-based execution - often with
+// encoded payloads to evade casual inspection.
+//
+// Your telemetry reveals that a PowerShell process executed with an
+// EncodedCommand, writing out a diagnostic artifact into the CorpHealth folder.
+//
+// It's time to identify exactly which encoded payload was executed.
+//
+// YOUR TASK:
+// Determine what decoded PowerShell command was executed FIRST.
+//
+// ANALYST THINKING:
+// Filter for -EncodedCommand in ProcessCommandLine
+// Filter for AccountName = ops.maintenance (avoid system processes)
+// Extract and decode Base64 string using KQL base64_decode_tostring()
+// PowerShell uses Unicode encoding, so decode accordingly
+// ===========================================
+
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where ProcessCommandLine contains "-EncodedCommand"
+| where AccountName == "ops.maintenance" // Filter out system processes
+| extend EncodedCommand = extract(@"-EncodedCommand\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)
+| extend DecodedCommand = base64_decode_tostring(EncodedCommand)
+| project TimeGenerated, AccountName, EncodedCommand, DecodedCommand, ProcessCommandLine
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: Write-Output 'token-6D5E4EE08227'
+// SIGNIFICANCE: Attacker executing obfuscated PowerShell to output token
+// TECHNIQUE: Base64 encoding to evade signature-based detection
+// TOKEN PATTERN: Hexadecimal identifier suggests credential or session token
+// NEXT STEP: Investigate token privilege modifications
+
+// ===========================================
+// FLAG 14: PRIVILEGE TOKEN MODIFICATION
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've traced the suspicious registry activity and the scheduled
+// persistence artifacts back to the same PowerShell execution chain.
+//
+// But the attacker didn't stop there.
+//
+// As you review deeper system events, something stands out:
+// Windows recorded a ProcessPrimaryTokenModified event, a behavior
+// consistent with attackers attempting to escalate privileges or adjust
+// token integrity to blend in with SYSTEM-level processes.
+//
+// YOUR TASK:
+// Pinpoint which process actually performed that token modification.
+// Identify the InitiatingProcessId.
+//
+// ANALYST THINKING:
+// Filter DeviceEvents where AdditionalFields contains:
+// - "tokenChangeDescription"
+// - "Privileges were added"
+// Recall the MaintenanceRunner script from Flag 1
+// ===========================================
+
+DeviceEvents
+| where DeviceName == "ch-ops-wks02"
+| where AdditionalFields contains "tokenChangeDescription" or AdditionalFields contains "Privileges were added"
+| extend TokenDetails = parse_json(AdditionalFields)
+| project 
+    TimeGenerated,
+    InitiatingProcessId,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    TokenDetails
+| order by TimeGenerated asc
+
+// FINDING: 4888
+// SIGNIFICANCE: Process ID 4888 modified its own token privileges
+// TECHNIQUE: Classic privilege escalation behavior
+// PROCESS: Likely MaintenanceRunner_Distributed.ps1 execution
+// NEXT STEP: Identify whose token was actually modified
+
+// ===========================================
+// FLAG 15: WHOSE TOKEN WAS MODIFIED?
+// ===========================================
+// INVESTIGATION CONTEXT:
+// You've confirmed that a process on CH-OPS-WKS02 modified its own token
+// privileges - a classic PrivEsc behavior.
+//
+// But you still don't know whose token was affected.
+//
+// Digging into the raw event details, you notice that the token modification
+// record doesn't just describe what changed; it also tells you which security
+// principal (SID) the token belongs to.
+//
+// That's crucial context:
+// - Was this a low-priv user?
+// - A domain user?
+// - Or a built-in local admin?
+//
+// If an attacker is adjusting privileges on the local Administrator token,
+// that significantly raises the risk profile of any follow-on activity.
+//
+// YOUR TASK:
+// Extract the security identifier (SID) the modified token belonged to.
+//
+// ANALYST THINKING:
+// Parse AdditionalFields JSON to find:
+// - OriginalTokenUserSid (matches CurrentTokenUserSid in this case)
+// This identifies which user account's privileges were elevated
+// ===========================================
+
+DeviceEvents
+| where DeviceName == "ch-ops-wks02"
+| where AdditionalFields contains "tokenChangeDescription"
+| extend TokenInfo = parse_json(AdditionalFields)
+| extend 
+    OriginalTokenUserSid = tostring(TokenInfo.OriginalTokenUserSid),
+    CurrentTokenUserSid = tostring(TokenInfo.CurrentTokenUserSid)
+| project 
+    TimeGenerated,
+    InitiatingProcessId,
+    OriginalTokenUserSid,
+    CurrentTokenUserSid
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: S-1-5-21-1605642021-30596605-784192815-1000
+// SIGNIFICANCE: SID belongs to local user account (RID 1000)
+// IMPLICATION: ops.maintenance account token was modified
+// RISK LEVEL: Elevated from standard user to higher privileges
+// NEXT STEP: Investigate tool transfer after privilege escalation
+
+// ===========================================
+// PHASE TRANSITION: INGRESS TOOL TRANSFER
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After the token-modification event on CH-OPS-WKS02, the activity on the
+// host shifted away from privilege manipulation and toward actions consistent
+// with staging follow-on tooling.
+//
+// Within minutes of the escalation, the workstation initiated outbound
+// traffic to an unfamiliar, dynamically generated external domain - an
+// unusual pattern for this device and user.
+//
+// The request originated from curl.exe, which is rarely used interactively
+// in this environment.
+//
+// Shortly afterward, Defender recorded the appearance and execution of a
+// new, unsigned binary placed directly in the user's profile directory.
+//
+// The process opened a local socket and attempted repeated outbound
+// connections to an external endpoint hosted on a tunneling service.
+//
+// These actions suggest the attacker moved quickly from local privilege
+// abuse to establishing a remote foothold.
+// ===========================================
+
+// ===========================================
+// FLAG 16: INGRESS TOOL TRANSFER FROM EXTERNAL DYNAMIC TUNNEL
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After the privilege escalation, Defender recorded a new executable being
+// written to disk on CH-OPS-WKS02.
+//
+// The timing and location of this file suggest it was delivered as staging
+// material for follow-on activity.
+//
+// YOUR TASK:
+// Identify the exact filename the attacker introduced.
+//
+// ANALYST THINKING:
+// Filter DeviceFileEvents by recent .exe writes
+// Look for file written into user profile path
+// Check which files were created immediately after curl.exe activity
+// ===========================================
+
+DeviceFileEvents
+| where DeviceName == "ch-ops-wks02"
+| where ActionType == "FileCreated"
+| where FileName endswith ".exe"
+| where FolderPath has "Users"
+| where TimeGenerated >= datetime(2025-11-23T03:47:21Z) // After token modification
+| project TimeGenerated, FolderPath, FileName, SHA256, FileSize
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: revshell.exe
+// SIGNIFICANCE: Reverse shell executable downloaded to user profile
+// NAMING: Blatant naming suggests confidence in evading detection
+// DELIVERY: Downloaded via external tunnel (upcoming flag)
+// NEXT STEP: Identify the download source URL
+
+// ===========================================
+// FLAG 17: EXTERNAL DOWNLOAD SOURCE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Before the suspicious file appeared on the workstation, the host reached
+// out to an external dynamic-tunnel domain using curl.exe.
+//
+// This outbound request fetched the executable later used in post-escalation
+// activity.
+//
+// YOUR TASK:
+// Identify the exact remote URL involved in this transfer.
+//
+// ANALYST THINKING:
+// Search for outbound HTTPS activity initiated by curl.exe
+// The domain name is long and hyphenated
+// It belongs to a tunneling platform (ngrok) often used for temporary
+// exposure of local services
+// ===========================================
+
+DeviceNetworkEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessFileName == "curl.exe"
+| where RemoteUrl contains "ngrok"
+| where RemoteUrl endswith ".exe"
+| project TimeGenerated, RemoteUrl, RemoteIP, InitiatingProcessCommandLine
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: https://unresuscitating-donnette-smothery.ngrok-free.dev/revshell.exe
+// SIGNIFICANCE: Attacker using ngrok tunnel to deliver payload
+// TECHNIQUE: Dynamic DNS tunnel bypasses traditional blocklists
+// IMPLICATION: Attacker has control over ngrok endpoint
+// NEXT STEP: Identify which process executed the downloaded binary
+
+// ===========================================
+// FLAG 18: EXECUTION OF THE STAGED UNSIGNED BINARY
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Shortly after the file was retrieved from the external tunnel, Defender
+// recorded its execution on CH-OPS-WKS02.
+//
+// The binary did not originate from any trusted software distribution
+// channel and was launched directly from the user's profile directory.
+//
+// This execution event marks the attacker's shift from staging to actively
+// running their tooling.
+//
+// YOUR TASK:
+// Determine which process executed the downloaded binary.
+//
+// ANALYST THINKING:
+// Look for execution of revshell.exe
+// The parent process is a common Windows shell component
+// It was launched in a way resembling typical user interaction
+// Execution happens after curl activity
+// ===========================================
+
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where FileName == "revshell.exe"
+| project 
+    TimeGenerated,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    AccountName
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: explorer.exe
+// SIGNIFICANCE: Launched via Windows Explorer (user-initiated or automated)
+// IMPLICATION: Attacker has interactive desktop access OR script mimicking user
+// TECHNIQUE: Using explorer.exe as parent makes execution appear benign
+// NEXT STEP: Identify external C2 infrastructure
+
+// ===========================================
+// FLAG 19: IDENTIFY THE EXTERNAL IP CONTACTED BY THE EXECUTABLE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After execution on CH-OPS-WKS02, the downloaded binary attempted to
+// initiate outbound communication to an external endpoint.
+//
+// Defender logged multiple failed TCP connection attempts to a remote IP
+// on a high-nonstandard port.
+//
+// This traffic does not match any approved services and was initiated
+// directly by the suspicious executable.
+//
+// YOUR TASK:
+// Identify the external IP address the process attempted to contact.
+//
+// ANALYST THINKING:
+// Filter DeviceNetworkEvents by executable name (revshell.exe)
+// Look for ConnectionFailed or ConnectionAttempted events
+// The destination port was 11746 (non-standard)
+// ===========================================
+
+DeviceNetworkEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessFileName == "revshell.exe"
+| where ActionType in ("ConnectionAttempted", "ConnectionFailed", "ConnectionSuccess")
+| where RemotePort == 11746
+| summarize 
+    FirstAttempt = min(TimeGenerated),
+    AttemptCount = count()
+    by RemoteIP, RemotePort
+| project RemoteIP, RemotePort, FirstAttempt, AttemptCount
+
+// FINDING: 13.228.171.119
+// SIGNIFICANCE: External C2 server IP (AWS infrastructure)
+// PORT: 11746 (high non-standard port, typical for C2)
+// CONNECTION: Multiple failed attempts suggest firewall blocking
+// NEXT STEP: Identify persistence mechanism for the executable
+
+// ===========================================
+// FLAG 20: PERSISTENCE VIA STARTUP FOLDER PLACEMENT
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After the downloaded binary executed and attempted outbound communication,
+// Defender recorded another file event involving the same executable.
+//
+// The file was copied into a Windows Startup directory - a location
+// frequently abused by attackers for simple persistence.
+//
+// Anything placed in this directory launches automatically at user logon.
+//
+// YOUR TASK:
+// Identify the exact folder path where the attacker attempted to establish
+// persistence for the executable.
+//
+// ANALYST THINKING:
+// Search DeviceFileEvents for .exe files written outside user profile
+// Look for directories containing "Start"
+// Path begins with C:\ProgramData\...
+// ===========================================
+
+DeviceFileEvents
+| where DeviceName == "ch-ops-wks02"
+| where FileName == "revshell.exe"
+| where FolderPath contains "StartUp" or FolderPath contains "Start Menu"
+| where ActionType in ("FileCreated", "FileCopied")
+| project TimeGenerated, FolderPath, ActionType, InitiatingProcessFileName
+
+// FINDING: C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\revshell.exe
+// SIGNIFICANCE: Automatic execution at ANY user logon
+// PERSISTENCE: Survives reboots, runs with user privileges
+// TECHNIQUE: Classic startup folder persistence (T1547.001)
+// NEXT STEP: Trace back to identify initial access method
+
+// ===========================================
+// PHASE TRANSITION: TRACING INITIAL ACCESS
+// ===========================================
+// INVESTIGATION CONTEXT:
+// With the attacker able to launch the malicious executable through
+// explorer.exe, it becomes clear that they had interactive access to the
+// desktop environment.
+//
+// This level of access typically indicates a remote session such as RDP
+// or similar remote-interaction tooling.
+//
+// To understand how the compromise began, we now work BACKWARD from the
+// established persistence and C2 activity toward the earlier session
+// metadata recorded on the device.
+//
+// Defender logs show multiple events tied to a Remote Session Device Name
+// and Remote Session IP. These values appear consistently across several
+// earlier suspicious actions, suggesting a common origin point for the
+// attacker's presence.
+//
+// This section focuses on identifying that source and retracing how the
+// adversary first gained access to CH-OPS-WKS02.
+// ===========================================
+
+// ===========================================
+// FLAG 21: IDENTIFY THE REMOTE SESSION SOURCE DEVICE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Several suspicious events - including file placement, network attempts,
+// and execution - share the same remote session metadata.
+//
+// This indicates the attacker interacted with CH-OPS-WKS02 through a
+// remote session rather than local physical access.
+//
+// YOUR TASK:
+// Identify the device name consistently listed as the remote session origin.
+//
+// ANALYST THINKING:
+// Look at previous KQL results where InitiatingProcessRemoteSessionDeviceName
+// is populated. The same value appears repeatedly across several event types.
+// The remote session field does not represent a hostname - treat it as
+// the session label used by the connection.
+// ===========================================
+
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where isnotempty(InitiatingProcessRemoteSessionDeviceName)
+| summarize 
+    EventCount = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by InitiatingProcessRemoteSessionDeviceName
+| order by EventCount desc
+
+// FINDING: 对手 (Chinese characters meaning "adversary")
+// SIGNIFICANCE: Attacker deliberately set remote device name to "adversary"
+// ATTRIBUTION: Clear indication of deliberate hostile activity
+// IMPLICATION: This is NOT a misconfigured admin - this is intentional compromise
+// NEXT STEP: Identify source IP of remote session
+
+// ===========================================
+// FLAG 22: IDENTIFY THE REMOTE SESSION IP ADDRESS
+// ===========================================
+// INVESTIGATION CONTEXT:
+// The same remote session metadata attached to multiple suspicious events
+// on CH-OPS-WKS02 includes a consistent originating IP address.
+//
+// This value represents the network source used by the adversary to
+// interact with the system.
+//
+// Identifying this IP allows you to track the adversary's entry point and
+// correlate it with authentication logs, lateral movement, or external
+// access patterns.
+//
+// YOUR TASK:
+// Identify the IP address that appears as the source of the remote session
+// tied to the attacker's activity.
+//
+// ANALYST THINKING:
+// Look for InitiatingProcessRemoteSessionIP fields
+// The value is identical across all suspicious events
+// The IP is not part of your internal 10.x address space
+// ===========================================
+
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessRemoteSessionDeviceName == "对手"
+| where isnotempty(InitiatingProcessRemoteSessionIP)
+| summarize count() by InitiatingProcessRemoteSessionIP
+| order by count_ desc
+
+// FINDING: 100.64.100.6
+// SIGNIFICANCE: CGNAT/relay range IP (100.64.0.0/10)
+// IMPLICATION: Connection through carrier-grade NAT or cloud relay
+// TECHNIQUE: Using shared IP space to obscure true origin
+// NEXT STEP: Identify internal pivot host
+
+// ===========================================
+// FLAG 23: IDENTIFY THE INTERNAL PIVOT HOST USED BY THE ATTACKER
+// ===========================================
+// INVESTIGATION CONTEXT:
+// The remote session metadata shows multiple IP addresses associated with
+// the attacker's activity.
+//
+// One of these addresses appears to be part of the internal Azure virtual
+// network, suggesting the adversary either compromised another VM first
+// or used an internal hop to reach CH-OPS-WKS02.
+//
+// Identifying this internal pivot point is essential to retracing the
+// attacker's route through the environment.
+//
+// YOUR TASK:
+// Identify which internal IP address (non-100.64.x.x) appears as part of
+// the attacker's remote session metadata.
+//
+// ANALYST THINKING:
+// Internal Azure subnets typically start with 10.x.x.x
+// Exclude IPs in 100.64.0.0/10 CGNAT/relay range
+// Use | distinct InitiatingProcessRemoteSessionIP to see all unique IPs
+// ===========================================
+
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where isnotempty(InitiatingProcessRemoteSessionIP)
+| distinct InitiatingProcessRemoteSessionIP
+| where InitiatingProcessRemoteSessionIP startswith "10." // Internal Azure subnet
+| where InitiatingProcessRemoteSessionIP !startswith "100.64" // Exclude CGNAT
+
+// FINDING: 10.168.0.7
+// SIGNIFICANCE: Internal Azure VM used as pivot point
+// LATERAL MOVEMENT: Attacker compromised another system first
+// ATTACK PATH: External → 10.168.0.7 → CH-OPS-WKS02
+// NEXT STEP: Identify first suspicious logon timestamp
+
+// ===========================================
+// FLAG 24: IDENTIFY THE FIRST SUSPICIOUS LOGON EVENT
+// ===========================================
+// INVESTIGATION CONTEXT:
+// To determine when the adversary FIRST accessed the system, we need to
+// look at the earliest logon event tied to their activity.
+//
+// This marks the true beginning of their presence on CH-OPS-WKS02.
+//
+// Multiple remote session IPs appear later in the attack timeline, but
+// only one timestamp reflects the very first successful logon.
+//
+// YOUR TASK:
+// Identify the earliest timestamp showing a suspicious logon to CH-OPS-WKS02.
+//
+// ANALYST THINKING:
+// Use DeviceLogonEvents
+// Sort by timestamp ascending
+// Logon types of interest: RemoteInteractive (10), Network (3), RDP-style
+// Look for accounts involved in later suspicious activity
+// ===========================================
+
+DeviceLogonEvents
+| where DeviceName == "ch-ops-wks02"
+| where LogonType in ("RemoteInteractive", "Network", "Unlock") // Logon types 10, 3, etc.
+| where AccountName in ("chadmin", "ops.maintenance") // Suspicious accounts
+| project TimeGenerated, AccountName, LogonType, RemoteIP, RemoteDeviceName
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: 2025-11-23T03:08:31.1849379Z
+// SIGNIFICANCE: TRUE START of the intrusion
+// TIMELINE: ~38 minutes BEFORE first beacon (03:46:08Z)
+// IMPLICATION: Attacker had 38 minutes of reconnaissance before deploying tools
+// NEXT STEP: Identify source IP of first logon
+
+// ===========================================
+// FLAG 25: IP ADDRESS USED DURING THE FIRST SUSPICIOUS LOGON
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After determining when the attacker first logged in, the next step is
+// identifying where they logged in FROM.
+//
+// The earliest logon event provides a direct indicator of the attacker's
+// initial network origin.
+//
+// This IP represents the start of the intrusion path and will help narrow
+// down whether the access came from another internal VM, a pivot device,
+// or an external relay.
+//
+// YOUR TASK:
+// Identify the IP address associated with the earliest suspicious logon.
+//
+// ANALYST THINKING:
+// Use the timestamp from previous flag as anchor point
+// Look for RemoteIP field in that exact logon event
+// Compare against other later logons to confirm it is the earliest
+// ===========================================
+
+DeviceLogonEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated == datetime(2025-11-23T03:08:31.1849379Z)
+| project RemoteIP
+
+// FINDING: 104.164.168.17
+// SIGNIFICANCE: External public IP - attacker's true origin point
+// GEOGRAPHY: Will be enriched in later flag
+// IMPLICATION: Direct external access, not lateral movement
+// NEXT STEP: Identify compromised account used for initial access
+
+// ===========================================
+// FLAG 26: ACCOUNT USED DURING THE FIRST SUSPICIOUS LOGON
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Knowing the timestamp and IP of the initial suspicious logon allows us
+// to pinpoint exactly which credentials the adversary leveraged to gain access.
+//
+// Identifying the compromised account is critical for understanding how
+// the attacker authenticated and whether they used stolen credentials,
+// a shared admin account, or a local user.
+//
+// YOUR TASK:
+// Determine which account name appears in the earliest suspicious logon event.
+//
+// ANALYST THINKING:
+// Use the earliest timestamp from previous flag to anchor search
+// Look at AccountName field for that exact logon event
+// Ensure you are looking only at that first event, not the ones that follow
+// ===========================================
+
+DeviceLogonEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated == datetime(2025-11-23T03:08:31.1849379Z)
+| project AccountName
+
+// FINDING: chadmin
+// SIGNIFICANCE: "chadmin" account - likely "Chinese admin" or similar
+// IMPLICATION: Attacker gained credentials for administrative account
+// NEXT ACCESS: Later switches to ops.maintenance for privileged operations
+// NEXT STEP: Geolocate attacker's origin
+
+// ===========================================
+// FLAG 27: DETERMINE THE ATTACKER'S GEOGRAPHIC REGION
+// ===========================================
+// INVESTIGATION CONTEXT:
+// The suspicious remote device authenticated into CH-OPS-WKS02 using
+// several public IPs within a range.
+//
+// To understand where the attacker was operating from, analysts often
+// enrich these IPs with geolocation data.
+//
+// Microsoft's geo_info_from_ip_address() function allows you to derive
+// country, region, and city information directly from KQL - no external
+// OSINT tools required.
+//
+// YOUR TASK:
+// Determine the attacker's geographic origin using geolocation enrichment.
+//
+// ANALYST THINKING:
+// Use suspicious IPs from previous flags
+// Use geo_info_from_ip_address(RemoteIP) to reveal country data
+// All suspicious IPs belong to same network range and map to same region
+// ===========================================
+
+let SuspiciousIPs = dynamic(["104.164.168.17", "100.64.100.6", "10.168.0.7"]);
+DeviceLogonEvents
+| where DeviceName == "ch-ops-wks02"
+| where RemoteIP in (SuspiciousIPs) or RemoteIP == "104.164.168.17"
+| extend GeoInfo = geo_info_from_ip_address(RemoteIP)
+| extend Country = tostring(GeoInfo.country)
+| summarize count() by Country
+| where isnotempty(Country)
+
+// FINDING: Vietnam
+// SIGNIFICANCE: Attacker operating from Vietnamese IP space
+// ATTRIBUTION: Combined with device name "对手" (Chinese) - possible misdirection
+// INTELLIGENCE: Vietnam is known source of APT activity
+// NEXT STEP: Identify attacker's first action after logon
+
+// ===========================================
+// FLAG 28: FIRST PROCESS LAUNCHED AFTER THE ATTACKER LOGGED IN
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After establishing the attacker's first login timestamp and origin IP,
+// the next step is determining what they did IMMEDIATELY after gaining access.
+//
+// Defender records each new process execution along with its associated
+// logon session, allowing analysts to trace the attacker's first action
+// on the system.
+//
+// This reveals whether the adversary began with exploration, privilege
+// escalation, or immediate deployment of tools.
+//
+// YOUR TASK:
+// Identify the first process launched by the attacker immediately after
+// logging in.
+//
+// ANALYST THINKING:
+// Use timestamp from earliest suspicious logon
+// Search DeviceProcessEvents for processes whose AccountName matches session
+// Sort by timestamp ascending and pick first process after login
+// Remember to reference AccountName AND InitiatingProcessAccountName
+// Earliest processes are often: cmd.exe, explorer.exe, notepad.exe
+// ===========================================
+
+let FirstLogonTime = datetime(2025-11-23T03:08:31.1849379Z);
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated >= FirstLogonTime
+| where AccountName == "chadmin" or InitiatingProcessAccountName == "chadmin"
+| project TimeGenerated, FileName, ProcessCommandLine, AccountName, InitiatingProcessAccountName
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: explorer.exe
+// SIGNIFICANCE: Windows Explorer launched - indicates GUI/desktop access
+// IMPLICATION: Attacker has full interactive session, not just command-line
+// TECHNIQUE: RDP or similar remote desktop technology
+// NEXT STEP: Identify first file accessed
+
+// ===========================================
+// FLAG 29: IDENTIFY THE FIRST FILE THE ATTACKER ACCESSED
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Once the attacker authenticated into the system, their very first action
+// can reveal their priorities and objectives.
+//
+// Early file access is often a strong indicator of what the attacker was
+// searching for - credentials, configuration data, operational details,
+// or system weaknesses.
+//
+// By examining the earliest file opened within the session, you can
+// identify exactly what they were after.
+//
+// YOUR TASK:
+// Identify what file the attacker opened first after the previous flag.
+//
+// ANALYST THINKING:
+// Use earliest suspicious logon timestamp as anchor point
+// Look at DeviceProcessEvents for processes with file arguments in command line
+// Attacker opened file using GUI application (not command-line)
+// Reference previous flag's ProcessID to find this flag's InitiatingProcessID
+// ===========================================
+
+let FirstProcessPID = 1234; // Replace with actual PID from Flag 28 results
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where InitiatingProcessId == FirstProcessPID
+| where ProcessCommandLine contains ".txt" or ProcessCommandLine contains "notepad"
+| extend OpenedFile = extract(@'([A-Za-z0-9_\-\s]+\.txt)', 1, ProcessCommandLine)
+| where isnotempty(OpenedFile)
+| project TimeGenerated, OpenedFile, ProcessCommandLine
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: CH-OPS-WKS02 user-pass.txt
+// SIGNIFICANCE: Credential file containing usernames and passwords
+// IMPLICATION: Attacker IMMEDIATELY went for stored credentials
+// TECHNIQUE: Reconnaissance → credential harvesting
+// NEXT STEP: Determine what attacker did with discovered credentials
+
+// ===========================================
+// FLAG 30: DETERMINE THE ATTACKER'S NEXT ACTION AFTER READING THE FILE
+// ===========================================
+// INVESTIGATION CONTEXT:
+// After viewing the file, the attacker moved on to their next step in
+// the intrusion chain.
+//
+// Early post-logon behavior often reveals operational intent - whether
+// they used stolen credentials, attempted lateral movement, escalated
+// privileges, or launched additional tooling.
+//
+// By examining process execution following the previous activity, analysts
+// can determine how the attacker leveraged the information found in the file.
+//
+// YOUR TASK:
+// Identify what the attacker did next after reading the file.
+//
+// ANALYST THINKING:
+// Use timestamp of previous activity as anchor
+// Search for next process execution immediately after file was opened
+// Next action may be:
+// - launching command shell (cmd.exe)
+// - attempting another logon
+// - executing recon commands (ipconfig, whoami, net user)
+// - initiating lateral movement
+// ===========================================
+
+let FileOpenTime = datetime(2025-11-23T03:08:35Z); // Approximate based on first process
+DeviceProcessEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated > FileOpenTime
+| where AccountName == "chadmin"
+| where FileName in ("ipconfig.exe", "whoami.exe", "net.exe", "nltest.exe", "cmd.exe", "powershell.exe")
+| project TimeGenerated, FileName, ProcessCommandLine
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: ipconfig.exe
+// SIGNIFICANCE: Network reconnaissance - mapping local network configuration
+// TECHNIQUE: Standard enumeration command
+// PATTERN: Credentials → Recon → Privilege escalation (typical attack flow)
+// NEXT STEP: Identify next account accessed after recon
+
+// ===========================================
+// FLAG 31: IDENTIFY THE NEXT ACCOUNT ACCESSED AFTER RECON
+// ===========================================
+// INVESTIGATION CONTEXT:
+// Following the attacker's first round of local reconnaissance, the
+// intrusion shifted from information-gathering to account-level interaction.
+//
+// This transition often marks the moment an adversary tests stolen
+// credentials, pivots to a higher-value user profile, or begins lateral
+// preparation.
+//
+// By analyzing logon activity immediately after the enumeration window,
+// defenders can pinpoint which account the attacker chose to access next -
+// a critical step in reconstructing intent and privilege escalation paths.
+//
+// YOUR TASK:
+// Identify which user account the attacker accessed immediately after
+// their initial enumeration activity.
+//
+// ANALYST THINKING:
+// Anchor time window to the moment enumeration completed
+// Look in DeviceLogonEvents for next successful logon event after that timestamp
+// Filter by suspicious remote session device name or IP (same one identified earlier)
+// You're looking for the next ACCOUNT used, not the next process
+// ===========================================
+
+let ReconCompleteTime = datetime(2025-11-23T03:10:00Z); // After ipconfig
+DeviceLogonEvents
+| where DeviceName == "ch-ops-wks02"
+| where TimeGenerated > ReconCompleteTime
+| where AccountName != "chadmin" // Different account
+| project TimeGenerated, AccountName, LogonType, RemoteIP
+| order by TimeGenerated asc
+| take 1
+
+// FINDING: ops.maintenance
+// SIGNIFICANCE: Switched to operational maintenance account with elevated privileges
+// ATTACK PROGRESSION: chadmin (initial access) → ops.maintenance (privileged operations)
+// TECHNIQUE: Credential abuse using stolen passwords from user-pass.txt file
+// TIMELINE COMPLETE: Initial access → Recon → Credential use → Privilege ops → Tool deployment
+
+// ===========================================
+// HUNT CLOSURE & INVESTIGATION SUMMARY
+// ===========================================
+// FINAL ANALYSIS:
+// By working backward through the attacker's activity - from persistence
+// artifacts to reconnaissance actions, then retracing initial access -
+// the full intrusion chain becomes clear.
+//
+// ATTACK TIMELINE RECONSTRUCTION:
+// 1. Initial Access (03:08:31Z) - External IP 104.164.168.17 → chadmin account
+// 2. Reconnaissance (03:08-03:10) - explorer.exe → user-pass.txt → ipconfig.exe
+// 3. Credential Abuse (03:10+) - Switch to ops.maintenance account
+// 4. Tool Deployment (03:46:08Z) - MaintenanceRunner_Distributed.ps1 beaconing
+// 5. Privilege Escalation (03:47:21Z) - Token modification, ConfigAdjust
+// 6. Persistence (03:47-04:00) - Scheduled tasks, Run keys, registry manipulation
+// 7. Tool Transfer (03:50+) - curl.exe → revshell.exe from ngrok tunnel
+// 8. C2 Communication (ongoing) - Attempted connections to 13.228.171.119:11746
+// 9. Final Persistence (04:00+) - revshell.exe → Startup folder
+//
+// INDICATORS OF COMPROMISE (IOCs):
+// - External IPs: 104.164.168.17 (initial), 13.228.171.119 (C2)
+// - Internal Pivot: 10.168.0.7
+// - Compromised Accounts: chadmin, ops.maintenance
+// - Malicious Files:
+//   - MaintenanceRunner_Distributed.ps1
+//   - revshell.exe (SHA256: [from Flag 16])
+//   - inventory_6ECFD4DF.csv (SHA256: 7f6393568e414fc564dad6f49a06a161618b50873404503f82c4447d239f12d8)
+//   - inventory_tmp_6ECFD4DF.csv (different hash)
+// - C2 Infrastructure:
+//   - 127.0.0.1:8080 (local proxy/tunnel)
+//   - https://unresuscitating-donnette-smothery.ngrok-free.dev/
+//   - 13.228.171.119:11746 (AWS-hosted C2)
+// - Persistence Mechanisms:
+//   - Scheduled Task: CorpHealth_A65E64
+//   - Run Key: MaintenanceRunner
+//   - Startup Folder: revshell.exe
+//
+// MITRE ATT&CK MAPPING:
+// - T1078.003 - Valid Accounts: Local Accounts (chadmin, ops.maintenance)
+// - T1133 - External Remote Services (RDP from Vietnam)
+// - T1087 - Account Discovery (ipconfig, recon commands)
+// - T1552.001 - Credentials in Files (user-pass.txt)
+// - T1548.002 - Abuse Elevation Control Mechanism: Bypass UAC (token modification)
+// - T1053.005 - Scheduled Task/Job: Scheduled Task
+// - T1547.001 - Boot or Logon Autostart: Registry Run Keys
+// - T1059.001 - Command and Scripting Interpreter: PowerShell
+// - T1027 - Obfuscated Files or Information (Base64 encoded commands)
+// - T1562.001 - Impair Defenses: Disable or Modify Tools (AV exclusion attempt)
+// - T1105 - Ingress Tool Transfer (curl → revshell.exe)
+// - T1071.001 - Application Layer Protocol: Web Protocols (ngrok tunnel)
+// - T1041 - Exfiltration Over C2 Channel (staged inventory files)
+//
+// CASE CLASSIFICATION CHANGE:
+// Initial: "Operations Activity Review"
+// Final: Confirmed Intrusion - External Actor, Credential Theft, C2 Established
+//
+// RECOMMENDED ACTIONS:
+// 1. Force password reset for ALL accounts on CH-OPS-WKS02
+// 2. Revoke ops.maintenance elevated privileges pending review
+// 3. Block IOC IPs at firewall: 104.164.168.17, 13.228.171.119
+// 4. Hunt for 10.168.0.7 compromise (internal pivot point)
+// 5. Review all logons from Vietnam IP ranges
+// 6. Implement MFA for administrative accounts
+// 7. Enable PowerShell Script Block Logging
+// 8. Deploy behavior-based EDR rules for token modification
+// 9. Alert on scheduled task creation outside change windows
+// 10. Investigate source of "chadmin" credential compromise
+//
+// ===========================================
