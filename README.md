@@ -20,8 +20,9 @@ This repository documents my cybersecurity investigations and threat detection w
 ## 📚 Investigation Index
 
 ### Incident Response Cases
-- [001 - CorpHealth Ransomware Attack Investigation](hunts/001-corphealth-ransomware-investigation.md) - *February 10, 2026*  
-  Complete end-to-end ransomware investigation from initial phishing access through data exfiltration and encryption. Includes full timeline reconstruction, IOC identification, MITRE ATT&CK mapping, and 8 KQL detection queries.
+- ### Incident Response Cases
+- [001 - CorpHealth Operations Activity Review](hunts/001-corphealth-operations-activity-review.md) - *February 10, 2026*  
+Confirmed intrusion investigation. External attacker from Vietnam gained persistent access to operational workstation using compromised credentials, deployed C2 infrastructure via ngrok tunnel, established multiple persistence mechanisms over 7+ days. Complete timeline reconstruction from 31 investigation flags covering initial RDP access through sustained C2 beaconing. **MITRE Techniques:** 15 across 8 tactics.
 
 ### Threat Hunts
 - Coming Soon: 
